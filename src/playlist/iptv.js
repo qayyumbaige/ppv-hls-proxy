@@ -8,9 +8,6 @@ import { resolveEmbedStreamUrl } from '../embed/decrypt.js'
  */
 const DEFAULT_LIVE_WINDOW_SECS = 4 * 3600
 
-/**
- * Fetch all streams from the upstream API with domain failover.
- */
 async function fetchAllStreams() {
   const bases = getAllApiBases()
   let lastError = null
@@ -38,9 +35,6 @@ async function fetchAllStreams() {
   throw new Error(lastError || 'all API domains failed')
 }
 
-/**
- * Fetch metadata for a single stream by URI, with domain failover.
- */
 async function fetchStreamMeta(uri) {
   const bases = getAllApiBases()
   let lastError = null
@@ -51,8 +45,6 @@ async function fetchStreamMeta(uri) {
         headers: { 'User-Agent': USER_AGENT },
       })
       if (!res.ok) {
-        // A genuine upstream 404 means the item doesn't exist anywhere —
-        // don't waste 6 more round trips walking the mirror chain.
         if (res.status === 404) throw new Error(`not found: ${uri}`)
         lastError = `upstream ${res.status} from ${base}`
         continue
@@ -75,48 +67,110 @@ async function fetchStreamMeta(uri) {
   throw new Error(lastError || 'all API domains failed')
 }
 
-/**
- * Escape a string for safe inclusion in M3U attributes.
- */
 function escAttr(s) {
   return String(s || '').replace(/"/g, "'")
 }
 
-/**
- * Is this stream live right now?
- * - 24/7 channels are always live.
- * - Otherwise it must have started, and not yet ended (or, with no end time,
- *   be within the default live window after kickoff).
- */
-function isLiveNow(stream, now) {
-  if (stream.always_live) return true
-  const start = Number(stream.starts_at) || 0
-  const end = Number(stream.ends_at) || 0
-  if (!start || start > now) return false
-  if (end) return end >= now
-  return now - start <= DEFAULT_LIVE_WINDOW_SECS
+/** Normalise a raw timestamp into epoch *seconds* (handles ms + ISO strings). */
+function toEpochSeconds(raw) {
+  if (raw === null || raw === undefined || raw === '') return 0
+  let n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    const t = Date.parse(raw)
+    if (!Number.isNaN(t)) n = Math.floor(t / 1000)
+    else return 0
+  }
+  if (n > 1e12) n = Math.floor(n / 1000) // ms → secs
+  return Math.floor(n)
+}
+
+/** Pull start/end times off a stream, tolerating several field spellings. */
+function getSchedule(stream) {
+  const start =
+    toEpochSeconds(stream.starts_at) ||
+    toEpochSeconds(stream.start_time) ||
+    toEpochSeconds(stream.startTime) ||
+    toEpochSeconds(stream.start) ||
+    toEpochSeconds(stream.date)
+
+  const end =
+    toEpochSeconds(stream.ends_at) ||
+    toEpochSeconds(stream.end_time) ||
+    toEpochSeconds(stream.endTime) ||
+    toEpochSeconds(stream.end)
+
+  return { start, end }
 }
 
 /**
- * A category name counts only if it's a real, non-empty label.
+ * Classify a stream's state:
+ * - "live"     → airing right now (or 24/7)
+ * - "upcoming" → has a start time in the future
+ * - null       → finished / expired / no usable schedule
  */
+function classifyStream(stream, now) {
+  if (stream.always_live) return 'live'
+
+  const { start, end } = getSchedule(stream)
+  if (!start) return null
+
+  if (start > now) return 'upcoming'
+  if (end && end < now) return null
+  if (end) return 'live'
+  return now - start <= DEFAULT_LIVE_WINDOW_SECS ? 'live' : null
+}
+
+function formatEventTime(startSecs, { includeDate = false } = {}) {
+  const start = Number(startSecs) || 0
+  if (!start) return ''
+  const d = new Date(start * 1000)
+  const pad = (n) => String(n).padStart(2, '0')
+  const time = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`
+  if (!includeDate) return time
+  const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`
+  return `${date} ${time}`
+}
+
+function buildLabel(stream, name, state) {
+  const { start } = getSchedule(stream)
+  if (state === 'live') {
+    const when = formatEventTime(start, { includeDate: false })
+    return when ? `Live @ ${when} — ${name}` : `Live — ${name}`
+  }
+  const when = formatEventTime(start, { includeDate: true })
+  return when ? `Upcoming @ ${when} — ${name}` : `Upcoming — ${name}`
+}
+
 function cleanCategory(cat) {
   const name = String(cat.category || cat.category_name || '').trim()
   if (!name || name === '(?)' || name.toLowerCase() === 'uncategorized') return ''
   return name
 }
 
+/** The /streams index often omits schedule fields — fetch detail if missing. */
+async function enrichWithSchedule(stream) {
+  const { start } = getSchedule(stream)
+  if (start) return stream
+  if (!stream.uri_name) return stream
+  try {
+    const meta = await fetchStreamMeta(stream.uri_name)
+    return { ...meta, ...stream } // index fields win (iframe, substreams)
+  } catch {
+    return stream
+  }
+}
+
 /**
- * Generate an M3U8 playlist for IPTV players (TiviMate, IPTV Smarters, etc).
- * Only categorised, currently-live events are included (substreams follow
- * their parent event).
+ * Generate an M3U8 playlist that includes BOTH live and upcoming events.
+ * Labels:
+ *   Live     → "Live @ 14:30 UTC — Title"
+ *   Upcoming → "Upcoming @ 2026-10-03 20:00 UTC — Title"
  *
  * @param {string} origin - This server's origin, e.g. http://192.168.1.10:3000
  * @param {string} [categoryFilter] - Optional category name to filter by
- * @param {{liveOnly?: boolean}} [options] - liveOnly defaults to true
  * @returns {Promise<string>} M3U8 playlist text
  */
-export async function generatePlaylist(origin, categoryFilter, { liveOnly = true } = {}) {
+export async function generatePlaylist(origin, categoryFilter) {
   const categories = await fetchAllStreams()
   const now = Math.floor(Date.now() / 1000)
 
@@ -124,33 +178,38 @@ export async function generatePlaylist(origin, categoryFilter, { liveOnly = true
 
   for (const cat of categories) {
     const catName = cleanCategory(cat)
-    if (!catName) continue // skip uncategorised events entirely
+    if (!catName) continue
 
     if (categoryFilter && catName.toLowerCase() !== categoryFilter.toLowerCase()) continue
 
-    for (const stream of cat.streams || []) {
+    for (const rawStream of cat.streams || []) {
+      const stream = await enrichWithSchedule(rawStream)
+
       const name = stream.name || 'Unknown'
       const uri = stream.uri_name || ''
       if (!uri || !stream.iframe) continue
-      if (liveOnly && !isLiveNow(stream, now)) continue
+
+      const state = classifyStream(stream, now)
+      if (!state) continue // finished / expired only
 
       const logo = stream.poster || ''
       const group = catName
-      const id = uri.replace(/\//g, '-')
+      const label = buildLabel(stream, name, state)
+      const id = `${state}-${uri.replace(/\//g, '-')}`
 
       lines.push(
-        `#EXTINF:-1 tvg-id="${escAttr(id)}" tvg-name="${escAttr(name)}" tvg-logo="${escAttr(logo)}" group-title="${escAttr(group)}",${name}`,
+        `#EXTINF:-1 tvg-id="${escAttr(id)}" tvg-name="${escAttr(label)}" tvg-logo="${escAttr(logo)}" group-title="${escAttr(group)}",${label}`,
       )
       lines.push(`${origin}/live/${uri}.m3u8`)
 
-      // Add substreams as separate channel entries
       for (const sub of stream.substreams || []) {
         if (!sub.iframe || !sub.uri_name) continue
-        const subName = `${name} — ${sub.source_tag || sub.uri_name}`
-        const subId = sub.uri_name.replace(/\//g, '-')
+        const subTitle = `${name} — ${sub.source_tag || sub.uri_name}`
+        const subLabel = buildLabel(stream, subTitle, state)
+        const subId = `${state}-${sub.uri_name.replace(/\//g, '-')}`
 
         lines.push(
-          `#EXTINF:-1 tvg-id="${escAttr(subId)}" tvg-name="${escAttr(subName)}" tvg-logo="${escAttr(logo)}" group-title="${escAttr(group)}",${subName}`,
+          `#EXTINF:-1 tvg-id="${escAttr(subId)}" tvg-name="${escAttr(subLabel)}" tvg-logo="${escAttr(logo)}" group-title="${escAttr(group)}",${subLabel}`,
         )
         lines.push(`${origin}/live/${sub.uri_name}.m3u8`)
       }
@@ -160,12 +219,6 @@ export async function generatePlaylist(origin, categoryFilter, { liveOnly = true
   return lines.join('\n') + '\n'
 }
 
-/**
- * Find a substream by uri_name across the full event index.
- * Substream URIs are not top-level API items — they only exist nested
- * inside their parent stream's index entry, so a failed fetchStreamMeta()
- * for e.g. "247-willow-2" must fall back to this lookup.
- */
 async function findSubstream(uri) {
   const categories = await fetchAllStreams()
   for (const cat of categories) {
@@ -178,20 +231,11 @@ async function findSubstream(uri) {
   return null
 }
 
-/**
- * Resolve a live channel URI to its stream URL and embed context.
- * Used by the /live/ endpoint to relay HLS on-the-fly.
- *
- * @param {string} uri - Stream URI (e.g. "nfl-network" or "cfb/2026-10-03/byu-tcu")
- * @returns {Promise<{streamUrl: string, embed: {origin: string, path: string}}>}
- */
 export async function resolveLiveChannel(uri) {
   let data = null
   try {
     data = await fetchStreamMeta(uri)
   } catch (err) {
-    // Top-level lookup failed — the URI may be a substream (e.g. "247-willow-2").
-    // Resolve via its iframe URL from the event index, like /api/embed does.
     const sub = await findSubstream(uri)
     if (!sub) throw err
     const embed = embedFromSource({ data: sub.iframe })
